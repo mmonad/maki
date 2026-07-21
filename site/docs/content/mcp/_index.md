@@ -47,8 +47,46 @@ headers = { Authorization = "Bearer tok123" }
 | `headers` | map | | HTTP only |
 | `timeout` | u64 | 30000 | Milliseconds (1-300000) |
 | `enabled` | bool | true | |
+| `always_load` | bool | false | Skip tool search, load all tools upfront |
 
 Set `command` for stdio, `url` for HTTP. Pick one.
+
+One option lives at the top level of `mcp.toml`, outside any server:
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `defer_tools` | usize | 10 | Defer tools only when more than this many exist |
+
+## Tool search
+
+Every tool definition a server exposes costs context window space, on every request. Big servers like GitHub's ship dozens of tools when a task often needs three.
+
+Maki solves this the same way Claude Code does: MCP tool definitions are deferred by default. The model only sees a small `tool_search` tool that carries the names of all deferred tools. When a task needs one, the model searches by keywords, matches are ranked against tool names, descriptions, and parameter names, and the best 5 load with their full definitions on the next request. An exact tool name always ranks first, and extra matches are listed by name so the model can load them with one more search. Loaded tools stay available for the rest of the session. Each session keeps its own loads: a subagent searching for tools never adds them to the main conversation, and the other way around.
+
+You don't configure anything for this. Add servers, and only the tools the model actually uses take up context.
+
+Loads are sticky. A searched tool stays loaded for the rest of the session, calling a deferred tool loads it too, and when you resume a session the tools it was already using come back loaded.
+
+Deferral only kicks in when it pays off. With 10 or fewer tools across all your servers, everything loads upfront and there is no search step: a search round-trip, plus the prompt cache miss it causes, would cost more than the definitions themselves. The top-level `defer_tools` key moves that line:
+
+```toml
+defer_tools = 30
+
+[mcp.github]
+url = "https://api.githubcopilot.com/mcp/"
+```
+
+Set it to 0 to always defer, or to a number larger than your tool count to turn deferral off entirely. Tools from `always_load` servers never count toward the threshold.
+
+If one server's tools should always be visible without a search step, opt it out:
+
+```toml
+[mcp.linear]
+command = ["linear-mcp-server"]
+always_load = true
+```
+
+Use this for small servers you rely on every turn. Each upfront definition consumes context on every request, and loading new tools mid-session invalidates the provider's prompt cache once, so `always_load` on a big server costs more than a search round-trip.
 
 ## Naming and namespacing
 

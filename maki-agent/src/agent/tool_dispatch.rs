@@ -7,7 +7,7 @@ use std::time::Instant;
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
-use crate::mcp::{McpHandle, UNKNOWN_MCP};
+use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::registry::{ToolInvocation, ToolRegistry};
 use crate::tools::{LocalToolFn, ToolContext};
@@ -61,7 +61,7 @@ impl RecentCalls {
 /// shows a phantom spinner.
 pub async fn run(
     registry: &ToolRegistry,
-    mcp: Option<&McpHandle>,
+    mcp: Option<&McpSession>,
     id: String,
     name: &str,
     input: &Value,
@@ -184,7 +184,12 @@ pub async fn run(
                 done_error(message)
             }
         }
-    } else if mcp.is_some_and(|m| m.has_tool(mcp_lookup)) {
+    } else if let Some(mcp) = mcp.filter(|_| name == TOOL_SEARCH_TOOL_NAME) {
+        run_tool_search(mcp, id, input, ctx, emit)
+    } else if let Some(mcp) = mcp.filter(|m| m.has_tool(mcp_lookup)) {
+        // Calling a deferred tool counts as loading it, so its full
+        // definition joins the next request instead of staying schema-less.
+        mcp.mark_loaded(mcp_lookup);
         // MCP tools skip parsing, so we assemble the start event manually.
         let start = ToolStartEvent {
             id: id.clone(),
@@ -204,6 +209,44 @@ pub async fn run(
         let msg = format!("{UNKNOWN_TOOL_PREFIX}: {mcp_lookup}");
         warn!(tool = %mcp_lookup, "unknown tool");
         done_error(msg)
+    }
+}
+
+/// Runs without a permission gate: search only reveals names the deferred
+/// catalog already showed the model.
+fn run_tool_search(
+    mcp: &McpSession,
+    id: String,
+    input: &Value,
+    ctx: &ToolContext,
+    emit: Emit,
+) -> ToolDoneEvent {
+    let tool_id: Arc<str> = Arc::from(TOOL_SEARCH_TOOL_NAME);
+    let query = input["query"].as_str().unwrap_or_default();
+    if matches!(emit, Emit::Notify) {
+        let start = ToolStartEvent {
+            id: id.clone(),
+            tool: Arc::clone(&tool_id),
+            summary: format!("{TOOL_SEARCH_TOOL_NAME}: {query}"),
+            render_header: None,
+            annotation: None,
+            input: None,
+            raw_input: Some(input.clone()),
+            output: None,
+        };
+        let _ = ctx.event_tx.send(AgentEvent::ToolStart(Box::new(start)));
+    }
+    let (output, is_error) = match mcp.search_tools(query) {
+        Ok(out) => (out, false),
+        Err(e) => (e, true),
+    };
+    ToolDoneEvent {
+        id,
+        tool: tool_id,
+        output: ToolOutput::Plain(output.into()),
+        is_error,
+        annotation: None,
+        written_path: None,
     }
 }
 
@@ -345,7 +388,7 @@ async fn execute_mcp_tool(
 pub(super) async fn process_tool_calls(
     response: maki_providers::StreamResponse,
     recent_calls: &mut RecentCalls,
-    mcp: Option<&McpHandle>,
+    mcp: Option<&McpSession>,
     history: &mut super::history::History,
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
@@ -565,6 +608,110 @@ mod tests {
             assert_eq!(start.tool.as_ref(), "local_echo");
             assert_eq!(start.summary, "local_echo");
             assert_eq!(start.raw_input, Some(input));
+        });
+    }
+
+    #[test]
+    fn tool_search_routes_and_loads_matches() {
+        smol::block_on(async {
+            let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let done = run(
+                ToolRegistry::global(),
+                Some(&mcp),
+                "t1".into(),
+                TOOL_SEARCH_TOOL_NAME,
+                &serde_json::json!({"query": "issue"}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(!done.is_error, "got: {}", done.output.as_text());
+            assert_eq!(done.tool.as_ref(), TOOL_SEARCH_TOOL_NAME);
+            assert!(done.output.as_text().contains("srv__fetch_issue"));
+
+            let mut tools = serde_json::json!([]);
+            mcp.extend_tools(&mut tools);
+            let loaded = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "srv__fetch_issue");
+            assert!(loaded, "searched tool must join the next request");
+        });
+    }
+
+    #[test_case(serde_json::json!({"query": "  "}) ; "blank_query")]
+    #[test_case(serde_json::json!({}) ; "missing_query")]
+    fn tool_search_bad_query_is_error_event(input: Value) {
+        smol::block_on(async {
+            let mcp = crate::mcp::stub_session(&[("srv.tool", "")]);
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let done = run(
+                ToolRegistry::global(),
+                Some(&mcp),
+                "t1".into(),
+                TOOL_SEARCH_TOOL_NAME,
+                &input,
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), crate::mcp::SEARCH_EMPTY_QUERY);
+        });
+    }
+
+    #[test]
+    fn calling_deferred_mcp_tool_marks_it_loaded() {
+        smol::block_on(async {
+            let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "")]);
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.mcp = Some(mcp.clone());
+            let done = run(
+                ToolRegistry::global(),
+                Some(&mcp),
+                "t1".into(),
+                "srv__fetch_issue",
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert_eq!(done.tool.as_ref(), "srv.fetch_issue", "must route to MCP");
+
+            let mut tools = serde_json::json!([]);
+            mcp.extend_tools(&mut tools);
+            let names: Vec<&str> = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|t| t["name"].as_str())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["srv__fetch_issue"],
+                "called tool must join the next request"
+            );
+        });
+    }
+
+    #[test]
+    fn local_tool_named_tool_search_shadows_mcp_search() {
+        smol::block_on(async {
+            let mcp = crate::mcp::stub_session(&[("srv.tool", "")]);
+            let ctx = local_ctx(TOOL_SEARCH_TOOL_NAME, |_| Ok("local wins".into()));
+            let done = run(
+                ToolRegistry::global(),
+                Some(&mcp),
+                "t1".into(),
+                TOOL_SEARCH_TOOL_NAME,
+                &serde_json::json!({"query": "tool"}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert_eq!(done.output.as_text(), "local wins");
         });
     }
 

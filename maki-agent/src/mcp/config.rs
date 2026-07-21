@@ -125,6 +125,11 @@ pub struct McpServerInfo {
 
 #[derive(Deserialize, Default)]
 pub struct McpConfig {
+    /// Defer tools behind `tool_search` only when more than this many
+    /// non-`always_load` tools exist. `None` means the built-in default;
+    /// 0 always defers, a large value disables deferral.
+    #[serde(default)]
+    pub defer_tools: Option<usize>,
     #[serde(default)]
     pub mcp: HashMap<String, RawServerConfig>,
     #[serde(skip)]
@@ -137,6 +142,8 @@ pub struct RawServerConfig {
     pub enabled: bool,
     #[serde(default = "default_timeout")]
     pub timeout: u64,
+    #[serde(default)]
+    pub always_load: bool,
     #[serde(flatten)]
     pub transport: RawTransport,
 }
@@ -166,6 +173,9 @@ pub struct RawHttpFields {
 pub struct ServerConfig {
     pub name: String,
     pub timeout: Duration,
+    /// Skip deferral: every tool from this server enters the context upfront
+    /// instead of being discoverable through `tool_search`.
+    pub always_load: bool,
     pub transport: Transport,
 }
 
@@ -258,6 +268,7 @@ pub fn parse_server(name: String, server: RawServerConfig) -> Result<ServerConfi
     Ok(ServerConfig {
         name,
         timeout: Duration::from_millis(server.timeout),
+        always_load: server.always_load,
         transport,
     })
 }
@@ -286,6 +297,7 @@ pub fn load_config(cwd: &Path) -> (McpConfig, McpConfigErrors) {
                 for name in cfg.mcp.keys() {
                     merged.origins.insert(name.clone(), global_path.clone());
                 }
+                merged.defer_tools = cfg.defer_tools.or(merged.defer_tools);
                 merged.mcp.extend(cfg.mcp);
             }
             Err(e) => errors.add_error(e),
@@ -304,6 +316,7 @@ pub fn load_config(cwd: &Path) -> (McpConfig, McpConfigErrors) {
             for name in cfg.mcp.keys() {
                 merged.origins.insert(name.clone(), project_path.clone());
             }
+            merged.defer_tools = cfg.defer_tools.or(merged.defer_tools);
             merged.mcp.extend(cfg.mcp);
         }
         Err(e) => {
@@ -390,6 +403,7 @@ mod tests {
         RawServerConfig {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
+            always_load: false,
             transport: RawTransport::Stdio(RawStdioFields {
                 command: cmd.iter().map(|s| s.to_string()).collect(),
                 environment: HashMap::new(),
@@ -401,6 +415,7 @@ mod tests {
         RawServerConfig {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
+            always_load: false,
             transport: RawTransport::Http(RawHttpFields {
                 url: url.to_string(),
                 headers: HashMap::new(),
@@ -424,6 +439,31 @@ mod tests {
         cfg.timeout = timeout;
         let err = parse_server("srv".into(), cfg).unwrap_err();
         assert!(err.to_string().contains("timeout"));
+    }
+
+    #[test]
+    fn toml_deferral_fields_deserialize_and_default() {
+        let config: McpConfig = toml::from_str(
+            r#"
+defer_tools = 30
+
+[mcp.github]
+command = ["gh", "mcp-server"]
+always_load = true
+
+[mcp.other]
+command = ["other"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.defer_tools, Some(30));
+        assert!(config.mcp["github"].always_load);
+        assert!(!config.mcp["other"].always_load);
+        let parsed = parse_server("github".into(), config.mcp["github"].clone()).unwrap();
+        assert!(parsed.always_load);
+
+        let bare: McpConfig = toml::from_str("[mcp.srv]\ncommand = [\"x\"]").unwrap();
+        assert_eq!(bare.defer_tools, None);
     }
 
     #[test]
@@ -558,6 +598,7 @@ enabled = true
         let mut off = stdio_raw(&["echo"]);
         off.enabled = false;
         let config = McpConfig {
+            defer_tools: None,
             mcp: [
                 ("enabled".into(), stdio_raw(&["echo"])),
                 ("disabled-config".into(), off),
