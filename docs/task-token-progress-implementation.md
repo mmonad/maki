@@ -1,33 +1,35 @@
 # Task token progress implementation
 
-## Changes
+## Live usage data
 
-### Picker rendering
+Add a `ToolLive::Usage(String)` payload containing the fully formatted cumulative usage string. Format it in Rust from cumulative `TokenUsage`, resolved subagent `ModelPricing`, and fast-mode state before crossing into Lua, so the `on_usage` callback receives one string like `12.3k↑ 456↓ $0.123`. Before spawning the session forwarding task in `session()`, clone the callback sink installed by `maki.agent.call_tool` from that function's local `agent_ctx.live_sink` and move the clone into the forwarding task. `call_tool` first clears any inherited sink, then installs this new per-child sink before dispatch, so this does not enable grandchild streaming. It observes each child `TurnComplete` and accumulates its usage with explicit `saturating_add` for every `TokenUsage` field in a forwarding-task-local aggregate; do not use the type's ordinary `AddAssign` implementation. Format total input with widened or saturating arithmetic instead of `TokenUsage::total_input()`, whose ordinary additions can overflow. After each accumulation, send the current totals through that sink when present, then preserve normal forwarding of the same `TurnComplete`. Continue using terminal `Done` only for existing prompt totals and suppression. This prevents compaction `Done` events from causing duplicate progress updates. Usage includes compaction turns. As with the existing aggregate turn display, cost uses the session model's pricing, so a separately priced compaction turn is an accepted approximation.
 
-Update `ListPicker` so `is_spinning()` prepends the animated spinner to an item's existing detail. Build one owned display string and use its complete width for label truncation. A spinning item without detail keeps the current spinner-only rendering. Add an accessor that reports whether an open picker has a spinning item, and include that state in `App::is_animating` so idle tasks continue repainting the spinner.
+The live payload remains runtime-only and is not serialized or persisted.
 
-### Task entries
+## Standalone task routing
 
-Add an owned detail string to `TaskEntry`. Build all entries through one `App::task_entries` helper:
+For standalone tasks, add cloned `pricing: ModelPricing` and `fast: bool` runtime fields to `SubagentInfo`, mark both `#[serde(skip)]`, and populate them from `SessionState.params.model.pricing` after either explicit resolution or inherited-model cloning, plus the effective fast state when first creating `SubagentInfo`. Update every constructor and test fixture. Subagent `TurnComplete` events already reach the UI. After adding that event's usage to the child `Chat`, directly format the chat's cumulative usage with these fields and set the string on the parent task tool message by its exact tool ID in the same event handler, without using the child's pending-turn or `ToolResultsSubmitted` path.
 
-- Main chat: no finished state or detail.
-- Finished subtask: completion detail and no spinner.
-- Running subtask: spinner plus `<count> tokens` detail.
+Add targeted `Chat` and `MessagesPanel` methods that set usage by tool ID. Do not use `set_turn_usage_on_last_tool`, because concurrent task completions must update their matching parent tool call.
 
-Compute count by converting `input`, `cache_read`, `cache_creation`, and `output` to `u64`, summing them, and clamping to `u32::MAX` before calling `format_tokens`.
+## Batched task routing
 
-### Refresh
+Extend `maki.agent.call_tool` options and its generated Lua API documentation with an `on_usage` callback and forward `ToolLive::Usage` to it. Include `on_usage` when deciding whether to create the live-event channel, so usage-only callers work. The batch plugin stores the formatted usage on the matching child and rerenders. Its child header renderer measures every left span, annotation, and usage with one local UTF-8 width helper, requires at least one separating column, and pads usage across the batch buffer width derived from `maki.ui.terminal_size().cols` minus the existing tool-body indent. If the terminal width is zero or both sides do not fit, omit usage. This mirrors `append_right_info` in the normal full-width view; narrower split viewports may clip because Lua buffers do not receive their eventual render width. Batch child headers have no timestamp. Keep the model annotation on the left and use the same compact token and cost format as `format_turn_usage`.
 
-Add `App::refresh_task_picker`, which calls `replace_items` only while the picker is open. Invoke it only in the creation branch of `resolve_or_create_chat`, after subtask token accumulation, after a `ToolDone` that matches a subtask, before the early return from matching `SubagentHistory`, after direct subtask cancellation, and after parent-error `finish_subagents`. Existing whole-run cancellation continues closing overlays and needs no refresh.
+Task usage is not included in session or batch state. Restored standalone and batch-child views omit live usage metadata.
 
-### Tests
+Regenerate user documentation with `just gen-docs` after updating the Rust API doc comment.
 
-Add unit tests for:
+## Tests
 
-- Spinner and detail rendering together with correct width, preserving spinner-only behavior and animation scheduling.
-- Main chat exclusion.
-- Running zero-use display.
-- Input, cache, cache-creation, and output inclusion.
-- Saturated display calculation.
-- Finished-task completion detail.
-- Open-picker refresh after task creation, usage, normal completion, workflow completion, direct subtask cancellation, and parent error.
+Add tests proving:
+
+- standalone usage is attached to the matching parent task tool;
+- batched task usage updates the matching child header;
+- cumulative input, cached input, cache creation, and output are formatted;
+- child pricing, zero pricing, and fast pricing produce the expected cost;
+- repeated and compaction turns update cumulative usage without double-counting terminal `Done`;
+- concurrent tasks do not update each other's headers;
+- model annotations remain intact;
+- narrow terminal-width batch headers omit usage rather than corrupting layout;
+- restored standalone and batch-child views omit live usage metadata.

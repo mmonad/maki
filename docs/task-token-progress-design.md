@@ -2,26 +2,28 @@
 
 ## Problem
 
-The task picker shows whether a subtask is running or finished, but gives no indication that a running subtask is making progress. This can make active work appear stuck.
+A batch tool call shows its input tokens, output tokens, and cost at the right edge of its header. A task tool call shows its subagent model but not the subagent's cumulative usage, which makes active work harder to distinguish from a stalled task.
 
 ## Design
 
-Show each running subtask's cumulative token usage in the task picker's detail column, alongside its spinner. Extend `ListPicker` rendering so spinning items can retain and render their detail instead of replacing it with the spinner. Use the existing per-chat `TokenUsage`, widening every input, cache, and output component to `u64` before summing and clamping for the UI's existing compact token formatter, with a `tokens` label.
+Show each task subagent's cumulative usage on its `task` tool header using the same right-aligned format as other tool usage: `<input>↑ <output>↓ $<cost>`. Keep the model annotation beside the task name and place usage in the right-side usage area, matching the top-level batch header in the reference UI. This applies both to standalone tasks and task children rendered inside a batch.
 
-The main chat keeps its current presentation. Finished subtasks keep the completion mark because activity is useful while waiting, while completion state is more useful afterward.
+Update standalone task usage after every internal model turn. Batched task usage updates after each internal model turn through its live callback. Input includes uncached, cache-read, and cache-creation tokens. Output is the cumulative output count. Cost uses the subagent session model's pricing and fast-mode multiplier. If auto-compaction uses a separately priced model, its tokens retain the existing aggregate-cost approximation and are priced as the session model. Models with zero pricing omit cost, matching the existing formatter.
 
-Token usage is a per-turn activity indicator, not a completion percentage or continuous streaming counter. Compact rounding means some small updates may not change the displayed value. A single task-entry builder is the authoritative projection of chat state. When the picker is open, usage updates, task creation, normal completion, workflow history completion, direct subtask cancellation, and parent failure replace its items in place so search and selection are preserved where possible. Whole-run cancellation keeps its existing behavior of closing overlays.
+Usage is a per-turn activity indicator, not a completion percentage or continuous streaming counter. A long first model response or tool execution can still show no usage until that turn completes. Task usage is live presentation state and is not reconstructed when restoring a session. At narrow full-terminal widths, batch child headers omit right-side usage when it does not fit. A narrower split viewport may clip terminal-width-aligned batch usage because Lua buffers do not receive their eventual viewport width.
 
 ## Scope
 
-This change only affects task-picker presentation and refresh behavior. It does not alter agent events, persistence, cancellation, timeout policy, or task lifecycle states.
+This changes task usage propagation and parent tool-header presentation. It does not change the task picker, agent cancellation, timeout policy, or task lifecycle states.
 
 ## Acceptance criteria
 
-- A running subtask displays a spinner and its cumulative total input and output token count.
+- A task header displays cumulative subagent input tokens, output tokens, and cost in the existing tool-usage format.
+- Usage appears at the right edge of the terminal-width batch buffer, matching batch-level usage in the normal full-width view.
+- The subagent model annotation remains visible.
+- Usage updates after each completed subagent turn.
 - Cached and cache-creation input tokens are included.
-- The count uses the existing compact token format and cannot wrap during display calculation.
-- An open task picker updates when new usage arrives or the task finishes.
-- Finished subtasks display the existing completion mark instead of token activity.
-- The main chat does not display a token-activity detail.
-- Tests cover running, zero-use, cached-input, finished, main-chat, task creation, usage refresh, normal and workflow completion, cancellation, and parent-error refresh cases.
+- Cost uses the subagent session model and fast-mode pricing, with the documented compaction approximation.
+- Zero-priced models omit cost.
+- Concurrent standalone and batched tasks update only their matching task header.
+- Restored tasks omit live usage metadata.

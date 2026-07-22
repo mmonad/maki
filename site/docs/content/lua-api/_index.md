@@ -733,8 +733,8 @@ maki.agent.call_tool({ctx}, {name}, {input}, {opts?})
 Run a tool by name and wait for the result. This is how you call built-in
 tools (like `read`, `bash`, `glob`) from Lua without going through the LLM.
 
-Live events (streaming output, annotations) are delivered through optional
-callbacks while the tool runs.
+Live events (streaming output, annotations, cumulative usage) are delivered
+through optional callbacks while the tool runs.
 
 **Parameters:**
 
@@ -747,6 +747,8 @@ callbacks while the tool runs.
     the tool publishes. Must not yield.
   - `on_annotation` (`function?`) called with an annotation string for each
     annotation event. Must not yield.
+  - `on_usage` (`function?`) called with a formatted cumulative token usage
+    string. Must not yield.
 
 **Returns:** (`string?`, `string?`) Tool output text, or `(nil, err)` on failure.
 
@@ -3906,6 +3908,22 @@ or wrapping text to fit the screen.
 local size = maki.ui.terminal_size()
 local half_width = math.floor(size.cols / 2)
 ```
+
+---
+
+### `maki.ui.display_width()` {#maki-ui-display_width}
+
+```lua
+maki.ui.display_width({text})
+```
+
+Returns the terminal display width of a string.
+
+**Parameters:**
+
+- `{text}` (`string`) Text to measure.
+
+**Returns:** (`integer`) Display columns occupied by the text.
 
 ---
 
