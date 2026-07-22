@@ -1,4 +1,3 @@
-use super::status_bar::format_tokens;
 use super::{DisplayMessage, ToolStatus};
 
 use super::code_view;
@@ -14,8 +13,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use unicode_width::UnicodeWidthStr;
-
-use maki_providers::{ModelPricing, TokenUsage};
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -39,6 +36,8 @@ pub const TOOL_INDICATOR: &str = "● ";
 pub const TOOL_BODY_INDENT: &str = "  ";
 pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
+const RIGHT_USAGE_STYLE_NAME: &str = "__maki_batch_right_usage";
+const RIGHT_TIMESTAMP_STYLE_NAME: &str = "__maki_batch_right_timestamp";
 
 const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
 
@@ -166,20 +165,6 @@ impl ToolLines {
 pub fn format_timestamp_now() -> String {
     let zoned = Timestamp::now().to_zoned(TimeZone::system());
     zoned.strftime("%H:%M:%S").to_string()
-}
-
-pub fn format_turn_usage(usage: &TokenUsage, pricing: &ModelPricing, fast: bool) -> String {
-    let tokens = format!(
-        "{}↑ {}↓",
-        format_tokens(usage.total_input()),
-        format_tokens(usage.output),
-    );
-    if pricing.is_zero() {
-        tokens
-    } else {
-        let cost = usage.cost(pricing, fast);
-        format!("{tokens} ${cost:.3}")
-    }
 }
 
 pub fn append_right_info(
@@ -494,7 +479,7 @@ impl ToolLineBuilder {
         let total = snapshot.lines.len();
         let frame = spinner_str(started_at.elapsed().as_millis());
         let (lines, spinners) =
-            snapshot_to_lines_range(snapshot, TOOL_BODY_INDENT, 0..total, frame);
+            snapshot_to_lines_range(snapshot, TOOL_BODY_INDENT, 0..total, frame, self.width);
         self.lines.extend(lines);
         self.spinner_lines
             .extend(spinners.into_iter().map(|(line, span)| (base + line, span)));
@@ -560,6 +545,7 @@ fn snapshot_to_lines_range(
     indent: &str,
     range: std::ops::Range<usize>,
     spinner_frame: &'static str,
+    width: u16,
 ) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
     let mut spinners = Vec::new();
     let lines = snapshot.lines[range]
@@ -567,10 +553,25 @@ fn snapshot_to_lines_range(
         .enumerate()
         .map(|(i, sline)| {
             let mut spans = vec![Span::raw(indent.to_string())];
-            bake_spans(&sline.spans, &mut spans, spinner_frame, |span_idx| {
+            let right_info = sline.spans.split_last().and_then(|(timestamp, rest)| {
+                let (usage, content) = rest.split_last()?;
+                matches!(&usage.style, SpanStyle::Named(name) if name == RIGHT_USAGE_STYLE_NAME)
+                    .then_some(())?;
+                matches!(&timestamp.style, SpanStyle::Named(name) if name == RIGHT_TIMESTAMP_STYLE_NAME)
+                    .then_some((content, usage.text.as_str(), timestamp.text.as_str()))
+            });
+            let (content, usage, timestamp) = right_info
+                .map_or((sline.spans.as_slice(), None, None), |(content, usage, timestamp)| {
+                    (content, Some(usage), Some(timestamp))
+                });
+            bake_spans(content, &mut spans, spinner_frame, |span_idx| {
                 spinners.push((i, span_idx));
             });
-            Line::from(spans)
+            let mut line = Line::from(spans);
+            if usage.is_some() || timestamp.is_some() {
+                append_right_info(&mut line, usage, timestamp, width);
+            }
+            line
         })
         .collect();
     (lines, spinners)
@@ -1684,7 +1685,7 @@ mod tests {
             text: "content".into(),
             style: SpanStyle::Default,
         }]]);
-        let (lines, _) = snapshot_to_lines_range(&snapshot, ">>", 0..1, "⠋ ");
+        let (lines, _) = snapshot_to_lines_range(&snapshot, ">>", 0..1, "⠋ ", 80);
         assert_eq!(lines.len(), 1);
         let first_span = &lines[0].spans[0];
         assert_eq!(first_span.content.as_ref(), ">>");
@@ -1706,9 +1707,49 @@ mod tests {
                 style: SpanStyle::Default,
             },
         ]]);
-        let (lines, _) = snapshot_to_lines_range(&snapshot, "", 0..1, "⠋ ");
+        let (lines, _) = snapshot_to_lines_range(&snapshot, "", 0..1, "⠋ ", 80);
         let texts: Vec<&str> = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(texts, vec!["", "aaa", "bbb", "ccc"]);
+    }
+
+    #[test_case(80, true  ; "shown_when_width_sufficient")]
+    #[test_case(30, false ; "hidden_when_too_narrow")]
+    fn snapshot_right_info_uses_tool_header_renderer(width: u16, visible: bool) {
+        let snapshot = make_snapshot(vec![vec![
+            SnapshotSpan {
+                text: "● task> Research".into(),
+                style: SpanStyle::Default,
+            },
+            SnapshotSpan {
+                text: "12.3k↑ 456↓ $0.123".into(),
+                style: SpanStyle::Named(RIGHT_USAGE_STYLE_NAME.into()),
+            },
+            SnapshotSpan {
+                text: "12:34:56".into(),
+                style: SpanStyle::Named(RIGHT_TIMESTAMP_STYLE_NAME.into()),
+            },
+        ]]);
+
+        let (lines, _) = snapshot_to_lines_range(&snapshot, TOOL_BODY_INDENT, 0..1, "⠋ ", width);
+        let line = &lines[0];
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(text.ends_with("12.3k↑ 456↓ $0.123  12:34:56"), visible);
+        if visible {
+            assert_eq!(
+                UnicodeWidthStr::width(text.as_str()),
+                usize::from(width) - 1
+            );
+            assert_eq!(
+                line.spans[line.spans.len() - 3].style,
+                theme::current().tool_dim
+            );
+            assert_eq!(line.spans.last().unwrap().style, theme::current().timestamp);
+        }
     }
 
     #[test]
@@ -1729,7 +1770,7 @@ mod tests {
                 },
             ],
         ]);
-        let (lines, spinners) = snapshot_to_lines_range(&snapshot, "", 0..2, "⠹ ");
+        let (lines, spinners) = snapshot_to_lines_range(&snapshot, "", 0..2, "⠹ ", 80);
         assert_eq!(spinners, vec![(1, 2)]);
         assert_eq!(lines[1].spans[2].content.as_ref(), "⠹ ");
     }
