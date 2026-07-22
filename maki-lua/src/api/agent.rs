@@ -3,9 +3,7 @@
 
 use std::collections::HashMap;
 use std::pin::pin;
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_lock::Mutex as AsyncMutex;
@@ -16,7 +14,7 @@ use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::{
     Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools, ToolAudience,
-    ToolContext, ToolFilter, ToolLive,
+    ToolContext, ToolFilter, ToolLive, format_usage,
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope, EventSender,
@@ -250,8 +248,8 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 /// Run a tool by name and wait for the result. This is how you call built-in
 /// tools (like `read`, `bash`, `glob`) from Lua without going through the LLM.
 ///
-/// Live events (streaming output, annotations) are delivered through optional
-/// callbacks while the tool runs.
+/// Live events (streaming output, annotations, cumulative usage) are delivered
+/// through optional callbacks while the tool runs.
 ///
 /// @param ctx LuaCtx Agent context.
 /// @param name string Tool name, e.g. `"bash"`, `"read"`.
@@ -262,6 +260,8 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 ///     the tool publishes. Must not yield.
 ///   `on_annotation` (function?) - called with an annotation string for each
 ///     annotation event. Must not yield.
+///   `on_usage` (function?) - called with a formatted cumulative token usage
+///     string. Must not yield.
 /// @return (string?, string?) Tool output text, or `(nil, err)` on failure.
 /// @example
 /// local out, err = maki.agent.call_tool(ctx, "bash", {
@@ -281,14 +281,15 @@ async fn call_tool(
     let input_json = lua_to_json(&lua, &input)?;
     let agent = try_pair!(dispatch_ctx(&ctx, "call_tool"));
     let mut tctx = agent.to_tool_context();
-    let (mut on_buf, mut on_ann, mut rx) = (None, None, None);
+    let (mut on_buf, mut on_ann, mut on_usage, mut rx) = (None, None, None, None);
     if let Some(o) = opts {
         if let Some(secs) = o.get::<Option<u64>>("timeout")? {
             tctx.deadline = Deadline::after(Duration::from_secs(secs));
         }
         on_buf = o.get::<Option<Function>>("on_live_buf")?;
         on_ann = o.get::<Option<Function>>("on_annotation")?;
-        if on_buf.is_some() || on_ann.is_some() {
+        on_usage = o.get::<Option<Function>>("on_usage")?;
+        if on_buf.is_some() || on_ann.is_some() || on_usage.is_some() {
             let (tx, r) = flume::unbounded();
             tctx.live_sink = Some(tx);
             rx = Some(r);
@@ -302,6 +303,7 @@ async fn call_tool(
         tool: &name,
         on_buf,
         on_ann,
+        on_usage,
     };
     let done = dispatch_racing_live(&tctx, &name, &input_json, rx, &cbs).await;
     // Same fallback the UI applies on tool completion, so a batch child's
@@ -464,20 +466,34 @@ async fn session(
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
-    let total_input = Arc::new(AtomicU32::new(0));
-    let total_output = Arc::new(AtomicU32::new(0));
+    let usage = Arc::new(Mutex::new((maki_providers::TokenUsage::default(), None)));
+    let (usage_sync_tx, usage_sync_rx) = flume::unbounded();
+    let live_sink = agent_ctx.live_sink.clone();
 
     {
         let info = Arc::clone(&subagent_info);
-        let ti = Arc::clone(&total_input);
-        let to = Arc::clone(&total_output);
+        let cumulative_usage = Arc::clone(&usage);
         let parent_tx = parent_tx.clone();
         smol::spawn(async move {
             while let Ok(mut envelope) = sub_rx.recv_async().await {
                 match &envelope.event {
-                    AgentEvent::Done { usage, .. } => {
-                        ti.fetch_add(usage.total_input(), Ordering::Relaxed);
-                        to.fetch_add(usage.output, Ordering::Relaxed);
+                    AgentEvent::TurnComplete(turn) => {
+                        let formatted = {
+                            let mut cumulative =
+                                cumulative_usage.lock().unwrap_or_else(|e| e.into_inner());
+                            cumulative.0 += turn.usage;
+                            if let Some(turn_cost) = turn.cost {
+                                cumulative.1 = Some(cumulative.1.unwrap_or_default() + turn_cost);
+                            }
+                            info.get()
+                                .map(|_| format_usage(&cumulative.0, cumulative.1))
+                        };
+                        if let (Some(sink), Some(formatted)) = (&live_sink, formatted) {
+                            let _ = sink.send(ToolLive::Usage(formatted));
+                        }
+                    }
+                    AgentEvent::Done { .. } => {
+                        let _ = usage_sync_tx.send(());
                         continue;
                     }
                     AgentEvent::Error { .. }
@@ -542,8 +558,8 @@ async fn session(
         subagent_info,
         local_tools: Arc::new(local_map),
         name,
-        total_input,
-        total_output,
+        usage,
+        usage_sync_rx,
         start: Instant::now(),
         closed: false,
     };
@@ -585,6 +601,7 @@ struct LiveCallbacks<'a> {
     tool: &'a str,
     on_buf: Option<Function>,
     on_ann: Option<Function>,
+    on_usage: Option<Function>,
 }
 
 impl LiveCallbacks<'_> {
@@ -592,6 +609,7 @@ impl LiveCallbacks<'_> {
         let res = match ev {
             ToolLive::Buf(buf) => call_opt(&self.on_buf, BufHandle::foreign(buf)).await,
             ToolLive::Annotation(ann) => call_opt(&self.on_ann, ann).await,
+            ToolLive::Usage(usage) => call_opt(&self.on_usage, usage).await,
         };
         if let Some(Err(e)) = res {
             tracing::warn!(tool = self.tool, error = %e, "call_tool callback failed");
@@ -666,8 +684,8 @@ struct SessionState {
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     local_tools: LocalTools,
     name: String,
-    total_input: Arc<AtomicU32>,
-    total_output: Arc<AtomicU32>,
+    usage: Arc<Mutex<(maki_providers::TokenUsage, Option<f64>)>>,
+    usage_sync_rx: flume::Receiver<()>,
     start: Instant,
     closed: bool,
 }
@@ -684,11 +702,12 @@ impl SessionState {
             tool_use_id: self.ui_id.clone(),
             messages,
         });
+        let usage = self.usage.lock().unwrap_or_else(|e| e.into_inner());
         info!(
             name = %self.name,
             duration_ms = self.start.elapsed().as_millis() as u64,
-            input_tokens = self.total_input.load(Ordering::Relaxed),
-            output_tokens = self.total_output.load(Ordering::Relaxed),
+            input_tokens = usage.0.total_input(),
+            output_tokens = usage.0.output,
             "subagent session closed",
         );
     }
@@ -778,6 +797,9 @@ async fn prompt(
     if let Err(e) = result {
         return Ok((None, Some(e.to_string())));
     }
+    if s.usage_sync_rx.recv_async().await.is_err() {
+        return Ok(err_pair("subagent usage tracker stopped"));
+    }
 
     let text = s
         .history
@@ -796,8 +818,9 @@ async fn prompt(
     let tbl = lua.create_table()?;
     tbl.set("text", text)?;
     tbl.set("duration_ms", s.start.elapsed().as_millis() as u64)?;
-    tbl.set("input_tokens", s.total_input.load(Ordering::Relaxed))?;
-    tbl.set("output_tokens", s.total_output.load(Ordering::Relaxed))?;
+    let usage = s.usage.lock().unwrap_or_else(|e| e.into_inner());
+    tbl.set("input_tokens", usage.0.total_input())?;
+    tbl.set("output_tokens", usage.0.output)?;
     Ok((Some(tbl), None))
 }
 

@@ -35,9 +35,9 @@ use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::{AgentConfig, AgentMode, EventSender, SharedBuf};
 use maki_config::ToolOutputLines;
-use maki_providers::Model;
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
+use maki_providers::{Model, TokenUsage};
 use maki_storage::id::SessionRef;
 
 pub struct DescriptionContext<'a> {
@@ -223,6 +223,25 @@ pub struct ToolContext {
 pub enum ToolLive {
     Buf(Arc<SharedBuf>),
     Annotation(String),
+    Usage(String),
+}
+
+pub fn format_usage(usage: &TokenUsage, cost: Option<f64>) -> String {
+    let total_input = usage.total_input();
+    let tokens = format!(
+        "{}↑ {}↓",
+        format_tokens(total_input),
+        format_tokens(usage.output)
+    );
+    cost.map_or(tokens.clone(), |cost| format!("{tokens} ${cost:.3}"))
+}
+
+fn format_tokens(tokens: u32) -> String {
+    match tokens {
+        0..1_000 => tokens.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", f64::from(tokens) / 1_000.0),
+        _ => format!("{:.1}m", f64::from(tokens) / 1_000_000.0),
+    }
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -578,6 +597,13 @@ mod tests {
     use super::*;
 
     const LINE_LIMIT: usize = 500;
+
+    #[test_case(TokenUsage { input: 12_000, output: 456, cache_creation: 200, cache_read: 100 }, None, "12.3k↑ 456↓" ; "without_cost")]
+    #[test_case(TokenUsage { input: 1_000_000, output: 100_000, cache_creation: 200_000, cache_read: 500_000 }, Some(5.4), "1.7m↑ 100.0k↓ $5.400" ; "with_cost")]
+    #[test_case(TokenUsage { input: u32::MAX, output: 1, cache_creation: 1, cache_read: 1 }, None, "4295.0m↑ 1↓" ; "input_saturates")]
+    fn usage_formatting(usage: TokenUsage, cost: Option<f64>, expected: &str) {
+        assert_eq!(format_usage(&usage, cost), expected);
+    }
 
     #[test_case(true  ; "vision_model_keeps_view_image")]
     #[test_case(false ; "text_only_model_loses_view_image")]
